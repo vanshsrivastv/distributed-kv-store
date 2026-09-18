@@ -16,7 +16,7 @@ answers here are the *refined* correct versions after discussion, not first atte
   interleaving those steps across threads loses updates
 - Why the compiler cannot catch race conditions (valid single-threaded syntax; the bug
   only exists across timing/interleaving, which is a runtime scheduling concern)
-- `synchronized` / mutual exclusion — and critically, that it only works if all threads
+- `synchronized` / mutual exclusion and critically, that it only works if all threads
   lock on the **same shared object** (`synchronized(new Object())` fails because a new
   object is created per call, so no thread ever contends with another)
 - `.join()` — why omitting it lets `main` print a stale/partial value before worker
@@ -96,4 +96,48 @@ work at all, which is exactly why it's wrong.
 
 ## Stage 2: Basic Single-Node KV Store
 
-**Status:** ⏳ Not started
+**Status:** Complete
+
+### Concepts covered
+- Instance-based design instead of static state, so multiple independent stores can exist
+- Encapsulation: `private` field so all changes go through `put`/`get`/`delete`
+- `final` on a field: the reference can't be reassigned, the contents can still change
+- Why `main` must be static (JVM entry point) without everything else being static
+- Always use braces on if/else, to avoid the dangling-else bug
+- Input validation: check `parts.length` before indexing, normalize whitespace
+  with `trim()` and `split("\\s+")`
+- `HashMap` is not thread-safe (fine here because the program is single-threaded)
+
+### What I built
+- `src/KVStore.java`: a `HashMap`-backed store with `put`, `get` (returns `null`
+  if missing) and `delete`, plus a console loop (`put k v`, `get k`, `delete k`, `exit`)
+- Bug found by testing: `put   a   b` (extra spaces) silently stored an empty key
+  because `split(" ")` produced empty strings. Fixed with `trim()` + `split("\\s+")`
+- Known small gap: `exit` is checked before `trim()`, so `exit ` with a trailing
+  space does not quit
+
+### Interview Checkpoint: Q&A
+
+**Q1: Why is `KVStore` instance-based instead of static?**
+A: Static state gives one shared copy for the whole program, so only one store could
+ever exist. Instance-based lets you create many independent stores. This matters for
+simulating several Raft nodes in one process for testing, and for unit tests that each
+need a fresh store.
+
+**Q2: Why is `data` private, and what breaks if it is public?**
+A: Private forces every change to go through `put`/`delete`. From Stage 4, `put` will
+write to the WAL before updating the map. If outside code could modify the map
+directly, it would skip the WAL and silently break crash recovery.
+
+**Q3: What does `final` on `data` prevent, and what does it not prevent?**
+A: It prevents reassigning `data` to a different map. It does not prevent changing
+the map's contents, so `data.put(...)` is fine.
+
+**Q4: Is `HashMap` safe if two threads call `put` at once?**
+A: No. Concurrent puts can lose updates (like the counter in Stage 1) and can corrupt
+the map's internal structure during a resize. Use `ConcurrentHashMap` or a lock.
+
+**Q5: What did the `put   a   b` bug teach about input validation?**
+A: The bug was silent: bad input was accepted and stored as wrong data, with no error.
+Input should be normalized or rejected explicitly at the boundary, never silently
+accepted. A loud failure is better than quietly corrupt data.
