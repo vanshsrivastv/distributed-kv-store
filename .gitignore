@@ -9,3 +9,6 @@ build/
 .vscode/
 .idea/
 *.iml
+ 
+ # VS Code Code Runner temp file
+tempCodeRunnerFile.java
