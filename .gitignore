@@ -1,0 +1,11 @@
+# Compiled Java class files - these get regenerated from .java source, never commit them
+*.class
+
+# Build tool output (once Maven/Gradle come in from Stage 8 onward)
+target/
+build/
+
+# IDE folders
+.vscode/
+.idea/
+*.iml
