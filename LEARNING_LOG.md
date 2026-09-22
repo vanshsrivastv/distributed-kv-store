@@ -141,3 +141,87 @@ the map's internal structure during a resize. Use `ConcurrentHashMap` or a lock.
 A: The bug was silent: bad input was accepted and stored as wrong data, with no error.
 Input should be normalized or rejected explicitly at the boundary, never silently
 accepted. A loud failure is better than quietly corrupt data.
+
+---
+
+## Stage 3: MemTable and SkipList
+
+**Status:** Complete (single-threaded)
+
+### Concepts covered
+- Why the MemTable must be sorted by key (SSTable = *Sorted* String Table; a sorted
+  MemTable flushes to disk with a simple in-order walk)
+- Why not `TreeMap`: it's sorted but rebalances on insert, which makes concurrent
+  access hard. A skip list only touches a few local pointers per insert
+- Skip list structure: level 0 holds every key; higher levels are sparser "express
+  lanes" built by giving each node a random height (repeated coin flips, so about
+  half of nodes reach the next level up, a quarter the one after that, geometric
+  distribution)
+- Verified the distribution empirically: 10,000 calls to the random-height function
+  produced counts that roughly halved at each level (4952, 2513, 1283, 629, ...),
+  matching the theoretical geometric distribution
+- Search/insert both walk from a `head` sentinel node, moving right while possible
+  and dropping a level when blocked; the stopping point at each level (the
+  predecessor) is exactly what an insert needs to splice pointers around
+- Tombstones: a delete cannot simply remove a key, because a MemTable has no
+  visibility into whether that key already exists in an older, immutable SSTable on
+  disk. Deleting must record a marker (a `tombstone` flag) so a later read stops and
+  reports "deleted" instead of falling through to stale data on disk. This applies
+  even when the key isn't currently in the MemTable at all
+- Refactored `put`/`delete`'s near-identical logic into one shared `upsert` helper,
+  parameterized by value and the tombstone flag, to remove duplication
+
+### What I built
+- `src/SkipList.java`: `Node` (key, value, tombstone flag, per-node `next` array
+  sized to that node's own random height), `randomHeight()`, `findPredecessors()`
+  (the core traversal, reused by every operation), `put`, `get`, `delete`, all
+  routed through a shared `upsert` helper
+- Verified with a manual test in `main`: insert three keys, read them back, overwrite
+  an existing key, delete it (confirmed `get` returns `null` afterward), then
+  re-insert the same key (confirmed it comes back correctly, tombstone cleared)
+
+### Known deferred work
+- Not thread-safe yet. Concurrency is deliberately deferred to Stage 8-9, once the
+  gRPC server introduces real concurrent access, so it can be tackled against an
+  actual concurrent workload rather than a hypothetical one
+
+### Interview Checkpoint: Q&A
+
+**Q1: Why does the MemTable need to be sorted, and why a skip list instead of a
+`TreeMap`?**
+A: SSTables are written in sorted order, so a sorted MemTable can be flushed with a
+simple in-order walk. A `TreeMap` is sorted but rebalances on insert, which can touch
+nodes far from the insertion point, making it hard for many threads to modify safely
+at once. A skip list's insert only touches a small number of local pointers, which
+makes it far more concurrency-friendly, even though this version is single-threaded
+for now.
+
+**Q2: How does a skip list get roughly O(log n) search without any rebalancing?**
+A: Each node is given a random height via repeated coin flips: roughly half the nodes
+reach height 2, a quarter reach height 3, and so on. This creates sparser "express
+lane" levels above the full bottom level, so a search can skip large chunks of the
+list at high levels and only walk carefully once it drops to the bottom. It's called
+probabilistic because the structure's shape depends on randomness, not on rebalancing
+logic reacting to inserts.
+
+**Q3: What does `findPredecessors` actually return, and why do both `get` and `put`
+need it?**
+A: For each level, the last node whose key is smaller than the target key (the
+`head` sentinel if none). `get` only needs level 0's predecessor to check the next
+node for a match. `put`/`delete` need the full array, because those are exactly the
+pointers that must be rewired to splice a new node into every level it participates
+in.
+
+**Q4: Why can't `delete` just remove the node from the MemTable?**
+A: The MemTable can't see whether that key already exists in an older SSTable on
+disk. If delete just removed the in-memory node, a later `get` would find nothing in
+the MemTable and fall through to the stale value on disk. Delete has to leave a
+tombstone marker behind, even for a key not currently in the MemTable, so a read
+knows to stop and report "deleted" rather than searching further down.
+
+**Q5: Why was extracting `upsert` a real improvement, not just cosmetic?**
+A: `put` and `delete` had identical predecessor-lookup and pointer-splicing logic,
+differing only in the value and tombstone flag. Duplicated logic means a bug fix
+(e.g. in the splicing order) has to be made in two places, and it's easy to fix one
+and forget the other. Parameterizing the shared logic into one method removes that
+risk entirely.
