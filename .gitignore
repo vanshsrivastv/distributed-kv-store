@@ -10,5 +10,8 @@ build/
 .idea/
 *.iml
  
- # VS Code Code Runner temp file
+# VS Code Code Runner temp file
 tempCodeRunnerFile.java
+
+# WAL data files
+*.log
