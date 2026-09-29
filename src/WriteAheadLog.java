@@ -1,73 +1,168 @@
-import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.EOFException;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.FileReader;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
+import java.util.zip.CRC32;
 
 public class WriteAheadLog {
 
+    private static final byte PUT = 0;
+    private static final byte DELETE = 1;
+
     private final FileOutputStream output;
+    private final DataOutputStream dataOutput;
     private final String filePath;
 
     public WriteAheadLog(String filePath) throws IOException {
         this.filePath = filePath;
         this.output = new FileOutputStream(filePath, true);
-    }
-
-    private void append(String record) throws IOException {
-
-        output.write(record.getBytes(StandardCharsets.UTF_8));
-        output.getFD().sync();
+        this.dataOutput = new DataOutputStream(output);
     }
 
     public void appendPut(String key, String value) throws IOException {
 
-        String record = "PUT " + key + " " + value + System.lineSeparator();
-
-        append(record);
+        byte[] payload = buildPutPayload(key, value);
+        append(payload);
     }
 
     public void appendDelete(String key) throws IOException {
 
-        String record = "DELETE " + key + System.lineSeparator();
+        byte[] payload = buildDeletePayload(key);
+        append(payload);
+    }
 
-        append(record);
+    private void append(byte[] payload) throws IOException {
+
+        CRC32 crc = new CRC32();
+        crc.update(payload);
+
+        long checksum = crc.getValue();
+
+        dataOutput.writeInt(payload.length);
+        dataOutput.write(payload);
+        dataOutput.writeLong(checksum);
+
+        output.getFD().sync();
+    }
+
+    private byte[] buildPutPayload(String key, String value)
+            throws IOException {
+
+        ByteArrayOutputStream buffer =
+                new ByteArrayOutputStream();
+
+        DataOutputStream dataOutput =
+                new DataOutputStream(buffer);
+
+        dataOutput.writeByte(PUT);
+        dataOutput.writeUTF(key);
+        dataOutput.writeUTF(value);
+
+        dataOutput.close();
+
+        return buffer.toByteArray();
+    }
+
+    private byte[] buildDeletePayload(String key)
+            throws IOException {
+
+        ByteArrayOutputStream buffer =
+                new ByteArrayOutputStream();
+
+        DataOutputStream dataOutput =
+                new DataOutputStream(buffer);
+
+        dataOutput.writeByte(DELETE);
+        dataOutput.writeUTF(key);
+
+        dataOutput.close();
+
+        return buffer.toByteArray();
     }
 
     public void recover(SkipList list) throws IOException {
 
-        try (BufferedReader reader = new BufferedReader(new FileReader(filePath))) {
+        try (DataInputStream input =
+                     new DataInputStream(new FileInputStream(filePath))) {
 
-            String line;
+            while (true) {
 
-            while ((line = reader.readLine()) != null) {
+                int payloadLength;
 
-                String[] parts = line.trim().split("\\s+");
-
-                if (parts[0].equals("PUT")) {
-
-                    if (parts.length != 3) {
-                        break;
-                    }
-
-                    list.put(parts[1], parts[2]);
-
-                } else if (parts[0].equals("DELETE")) {
-
-                    if (parts.length != 2) {
-                        break;
-                    }
-
-                    list.delete(parts[1]);
-
-                } else {
+                try {
+                    payloadLength = input.readInt();
+                } catch (EOFException e) {
                     break;
                 }
+
+                byte[] payload = new byte[payloadLength];
+
+                try {
+                    input.readFully(payload);
+                } catch (EOFException e) {
+                    System.out.println("Torn WAL record detected.");
+                    break;
+                }
+
+                long storedChecksum;
+
+                try {
+                    storedChecksum = input.readLong();
+                } catch (EOFException e) {
+                    System.out.println("Torn WAL record detected.");
+                    break;
+                }
+
+                CRC32 crc = new CRC32();
+                crc.update(payload);
+
+                long calculatedChecksum = crc.getValue();
+
+                if (storedChecksum != calculatedChecksum) {
+                    System.out.println("Corrupted WAL record detected.");
+                    break;
+                }
+
+                applyPayload(list, payload);
             }
         }
     }
 
+    private void applyPayload(SkipList list, byte[] payload)
+            throws IOException {
+
+        DataInputStream input =
+                new DataInputStream(
+                        new ByteArrayInputStream(payload));
+
+        byte type = input.readByte();
+
+        if (type == PUT) {
+
+            String key = input.readUTF();
+            String value = input.readUTF();
+
+            list.put(key, value);
+
+        } else if (type == DELETE) {
+
+            String key = input.readUTF();
+
+            list.delete(key);
+
+        } else {
+
+            System.out.println("Unknown WAL record type.");
+        }
+
+        input.close();
+    }
+
     public void close() throws IOException {
-        output.close();
+        dataOutput.close();
     }
 }
