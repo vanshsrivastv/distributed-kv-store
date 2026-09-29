@@ -1,43 +1,65 @@
-import java.util.*;
+import java.io.IOException;
+import java.util.Scanner;
 
 public class KVStore {
 
-    private final Map<String, String> data = new HashMap<>();
+    private static final String WAL_FILE = "store.wal";
 
-    public void put(String key, String value) {
-        data.put(key, value);
+    private final SkipList memtable;
+    private final WriteAheadLog wal;
+
+    public KVStore() throws IOException {
+
+        memtable = new SkipList();
+        wal = new WriteAheadLog(WAL_FILE);
+
+        wal.recover(memtable);
+    }
+
+    public void put(String key, String value) throws IOException {
+
+        wal.appendPut(key, value);
+        memtable.put(key, value);
     }
 
     public String get(String key) {
-        return data.get(key);
+
+        return memtable.get(key);
     }
 
-    public void delete(String key) {
-        data.remove(key);
+    public void delete(String key) throws IOException {
+
+        wal.appendDelete(key);
+        memtable.delete(key);
     }
 
-    public static void main(String[] args) {
+    public void close() throws IOException {
+
+        wal.close();
+    }
+
+    public static void main(String[] args) throws IOException {
 
         KVStore store = new KVStore();
         Scanner sc = new Scanner(System.in);
 
         while (true) {
 
-    System.out.print("> ");
-    String input = sc.nextLine();
-    input = input.trim();
+            System.out.print("> ");
+            String input = sc.nextLine();
+            input = input.trim();
 
-    if (input.equals("exit")) {
-        break;
-    }
+            if (input.equals("exit")) {
+                break;
+            }
 
-    if (input.isEmpty()) {
-        System.out.println("Unknown Command");
-        continue;
-    }
+            if (input.isEmpty()) {
+                System.out.println("Unknown Command");
+                continue;
+            }
 
-    String[] parts = input.split("\\s+");
-    String command = parts[0];
+            String[] parts = input.split("\\s+");
+            String command = parts[0];
 
             if (command.equals("put")) {
 
@@ -68,6 +90,7 @@ public class KVStore {
             }
         }
 
+        store.close();
         sc.close();
     }
 }

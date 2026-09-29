@@ -15,3 +15,7 @@ tempCodeRunnerFile.java
 
 # WAL data files
 *.log
+
+# WAL data files
+*.log
+*.wal
