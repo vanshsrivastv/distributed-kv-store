@@ -225,3 +225,123 @@ differing only in the value and tombstone flag. Duplicated logic means a bug fix
 (e.g. in the splicing order) has to be made in two places, and it's easy to fix one
 and forget the other. Parameterizing the shared logic into one method removes that
 risk entirely.
+
+---
+
+## Stage 4: Write-Ahead Log and Crash Recovery
+
+**Status:** Complete
+
+### Concepts covered
+- Why a MemTable alone isn't durable: it lives entirely in RAM, so any crash loses
+  everything in it
+- Why the fix isn't "write the MemTable to disk": a skip list is a scattered pointer
+  structure, expensive to serialize incrementally, and disk is slow for scattered
+  writes but fast for sequential appends. The WAL is a separate, dumb, append-only
+  record of every operation, replayed to rebuild the MemTable after a crash
+- Write ordering: a write must reach the WAL before it's considered successful, since
+  updating the MemTable first and crashing before the WAL write loses that write with
+  no trace anywhere
+- `fsync`: the OS buffers writes in memory before they reach physical disk. A crash
+  between `write()` and the OS's own flush loses data even though `write()` already
+  returned. `fsync()` forces the buffered bytes to physical storage before returning,
+  at a real, measurable throughput cost, which is why batching multiple writes under
+  one `fsync` matters at scale
+- Started with a plain text format (`PUT key value` / `DELETE key`, one line per
+  record) to learn the concept, deliberately deferring the spec's binary format
+  requirement until the concept was solid
+- Text format's fatal weakness: a record torn by a mid-write crash (`PUT name va`
+  instead of `PUT name vansh`) still parses as a valid-looking, wrong record. No way
+  to detect it from the text alone, silent corruption
+- Upgraded to a binary, self-checking record format:
+  `[4-byte length][payload: type byte + key + value][8-byte CRC32 checksum]`.
+  The length prefix lets a truncated record be detected (not enough bytes left to
+  read), and the CRC32 checksum lets corrupted-but-complete bytes be detected (the
+  recomputed checksum won't match)
+- Distinguished three outcomes during replay: normal end of file (`EOFException`
+  while reading the next record's length, expected, not an error), a torn tail
+  record (`EOFException` while reading payload/checksum, meaning a crash happened
+  mid-write), and a corrupted record (length and byte count are fine, but the
+  checksum doesn't match). All three stop replay at that point rather than crashing
+  or silently applying bad data
+- Verified all of this experimentally rather than trusting the code: flipped one byte
+  inside a written record and confirmed the checksum check reported a mismatch;
+  truncated a multi-record WAL file after several real writes and confirmed replay
+  correctly recovered everything before the cut and reported the torn record instead
+  of silently losing or corrupting the earlier entries
+- Two-process crash test methodology: writing and recovering in the same process
+  proves nothing (a killed process still leaves OS-buffered writes intact), so
+  recovery is tested as a genuinely separate JVM run reading only what's on disk
+
+### What I built
+- `src/WriteAheadLog.java`: `appendPut`/`appendDelete` build a framed binary record
+  and write it to a kept-open `FileOutputStream`, `fsync`-ing after every write;
+  `recover(SkipList)` replays a WAL file into a MemTable, stopping cleanly at EOF,
+  a torn record, or a checksum mismatch
+- `src/CrashRecoveryTest.java`: `run1` performs several puts and a delete against a
+  fresh WAL and MemTable, exits without an orderly shutdown; `run2`, a separate JVM
+  invocation, builds an empty MemTable, replays the WAL, and confirms the state
+  matches, including the deleted key correctly returning `null`
+- `src/BinaryWALTest.java`: scratch file used to build up the binary format
+  incrementally (one record, then length-prefixed, then checksummed, then
+  write/read split into separate runs) before folding it into the real class
+
+### Known deferred work
+- Batching multiple appends under a single `fsync` is deferred until there's real
+  concurrent write pressure to batch against, expected once the gRPC server exists
+  (same reasoning as deferring MemTable thread-safety in Stage 3)
+- WAL truncation/deletion once its data is safely flushed to an SSTable is a Stage 5
+  concern, not handled yet, the WAL currently grows forever
+
+### Interview Checkpoint: Q&A
+
+**Q1: Why does a write have to reach the WAL before it's considered durable, rather
+than the MemTable?**
+A: The MemTable lives only in RAM and is lost on any crash. If the MemTable were
+updated first and the process crashed before the WAL write happened, that write
+would be gone with no record anywhere that it was ever attempted. Writing to the WAL
+first (or at least before acknowledging success) means the WAL always has a durable
+record to replay, even if the MemTable itself never saw the update before a crash.
+
+**Q2: What does `fsync` actually guarantee, and what does a plain `write()` call not
+guarantee?**
+A: `write()` only hands bytes to the operating system's buffer; the OS decides when
+to actually flush that buffer to physical storage. If the machine loses power or the
+kernel crashes before that flush happens, the written bytes are lost even though
+`write()` returned successfully. `fsync()` blocks until the OS has actually flushed
+those bytes to physical storage, so only after it returns can the write be trusted to
+survive a real crash.
+
+**Q3: Why wasn't the plain text WAL format good enough, even though it worked in
+testing?**
+A: A record torn by a crash mid-write (e.g. `PUT name va` instead of `PUT name
+vansh`) still looks like a syntactically valid, complete record. There's no way to
+tell a genuinely short value from a truncated one, so replay would silently accept
+wrong data as correct, which is worse than a crash that's at least visible.
+
+**Q4: What problem does the length prefix solve, and what problem does the CRC32
+checksum solve? Why are both needed?**
+A: The length prefix tells the reader exactly how many bytes the record should
+contain, so if the file runs out before that many bytes are available, the reader
+knows for certain the record is truncated. The checksum catches a different failure:
+bytes that are all present (the length matches) but wrong, corrupted, or altered.
+Length alone can't catch corruption within a complete-looking record, and a checksum
+alone can't tell you where a record was supposed to end. Together they catch both
+failure modes.
+
+**Q5: Why does a WAL replay treat "end of file while reading a record's length"
+differently from "end of file while reading its payload or checksum"?**
+A: The first case just means there are no more records, which is the normal,
+expected way replay finishes. The second case means a record was started but never
+finished, evidence that a crash happened during that specific write. Both result in
+stopping replay at that point, but only the second one indicates an actual torn
+write worth being aware of.
+
+**Q6: Why does testing crash recovery require two separate process runs instead of
+one program that writes then reads?**
+A: Writing and reading in the same process doesn't prove anything about crash
+survival, because the OS may still flush its write buffer to disk after the process
+exits normally or even after it's killed, masking whether the WAL and `fsync` logic
+actually works. Running recovery as a genuinely separate process, reading only what
+already exists on disk from a prior run, is the only way to confirm the data's
+durability doesn't depend on that first process still being alive.
