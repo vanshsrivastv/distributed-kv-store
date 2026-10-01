@@ -1,3 +1,5 @@
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 
 public class SkipList {
@@ -16,6 +18,53 @@ public class SkipList {
             this.value = value;
             this.tombstone = tombstone;
             this.next = new Node[height];
+        }
+    }
+
+    public static class Entry {
+
+        public final String key;
+        public final String value;
+        public final boolean tombstone;
+
+        public Entry(String key, String value, boolean tombstone) {
+            this.key = key;
+            this.value = value;
+            this.tombstone = tombstone;
+        }
+
+        @Override
+        public String toString() {
+            return "Entry{" +
+                    "key='" + key + '\'' +
+                    ", value='" + value + '\'' +
+                    ", tombstone=" + tombstone +
+                    '}';
+        }
+    }
+
+    public enum Status {
+        FOUND,
+        DELETED,
+        NOT_FOUND
+    }
+
+    public static class LookupResult {
+
+        public final Status status;
+        public final String value;
+
+        public LookupResult(Status status, String value) {
+            this.status = status;
+            this.value = value;
+        }
+
+        @Override
+        public String toString() {
+            return "LookupResult{" +
+                    "status=" + status +
+                    ", value='" + value + '\'' +
+                    '}';
         }
     }
 
@@ -79,19 +128,29 @@ public class SkipList {
         upsert(key, value, false);
     }
 
-    public String get(String key) {
+    public LookupResult lookup(String key) {
 
         Node[] predecessors = findPredecessors(key);
 
         Node next = predecessors[0].next[0];
 
-        if (next != null && next.key.equals(key)) {
+        if (next == null || !next.key.equals(key)) {
+            return new LookupResult(Status.NOT_FOUND, null);
+        }
 
-            if (next.tombstone) {
-                return null;
-            }
+        if (next.tombstone) {
+            return new LookupResult(Status.DELETED, null);
+        }
 
-            return next.value;
+        return new LookupResult(Status.FOUND, next.value);
+    }
+
+    public String get(String key) {
+
+        LookupResult result = lookup(key);
+
+        if (result.status == Status.FOUND) {
+            return result.value;
         }
 
         return null;
@@ -101,29 +160,41 @@ public class SkipList {
         upsert(key, null, true);
     }
 
+    public List<Entry> entries() {
+
+        List<Entry> result = new ArrayList<>();
+
+        Node current = head.next[0];
+
+        while (current != null) {
+
+            result.add(
+                    new Entry(
+                            current.key,
+                            current.value,
+                            current.tombstone
+                    )
+            );
+
+            current = current.next[0];
+        }
+
+        return result;
+    }
+
     public static void main(String[] args) {
 
         SkipList list = new SkipList();
 
-        list.put("name", "vansh");
-        list.put("age", "19");
-        list.put("city", "kanpur");
+        list.put("zebra", "animal");
+        list.put("apple", "fruit");
+        list.put("mango", "fruit");
+        list.put("banana", "fruit");
 
-        System.out.println(list.get("name"));
-        System.out.println(list.get("age"));
-        System.out.println(list.get("city"));
-        System.out.println(list.get("college"));
+        list.delete("mango");
 
-        list.put("name", "rahul");
-
-        System.out.println(list.get("name"));
-
-        list.delete("name");
-
-        System.out.println(list.get("name"));
-
-        list.put("name", "vansh");
-
-        System.out.println(list.get("name"));
+        System.out.println("apple: " + list.lookup("apple"));
+        System.out.println("mango: " + list.lookup("mango"));
+        System.out.println("kiwi: " + list.lookup("kiwi"));
     }
 }
