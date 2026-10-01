@@ -3,7 +3,9 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Scanner;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -22,7 +24,11 @@ public class KVStore {
     private long approxBytes = 0;
     private int sstableCounter = 0;
 
-    private final List<String> sstableFiles = new ArrayList<>();
+    private final List<String> sstableFiles =
+            new ArrayList<>();
+
+    private final Map<String, BloomFilter> bloomFilters =
+            new HashMap<>();
 
     public KVStore() throws IOException {
 
@@ -59,13 +65,33 @@ public class KVStore {
 
         for (File file : files) {
 
-            sstableFiles.add(file.getName());
+            String filePath = file.getName();
+
+            sstableFiles.add(filePath);
 
             int number =
-                    extractSSTableNumber(file.getName());
+                    extractSSTableNumber(filePath);
 
             if (number > highestNumber) {
                 highestNumber = number;
+            }
+
+            String bloomPath =
+                    filePath + ".bloom";
+
+            try {
+
+                BloomFilter filter =
+                        BloomFilter.load(bloomPath);
+
+                bloomFilters.put(filePath, filter);
+
+            } catch (IOException e) {
+
+                System.out.println(
+                        "Bloom filter unavailable for "
+                                + filePath
+                );
             }
         }
 
@@ -90,6 +116,7 @@ public class KVStore {
             throws IOException {
 
         wal.appendPut(key, value);
+
         memtable.put(key, value);
 
         approxBytes += key.length() + value.length();
@@ -112,18 +139,33 @@ public class KVStore {
             return null;
         }
 
-        for (int i = sstableFiles.size() - 1; i >= 0; i--) {
+        for (int i = sstableFiles.size() - 1;
+             i >= 0;
+             i--) {
 
-            String filePath = sstableFiles.get(i);
+            String filePath =
+                    sstableFiles.get(i);
+
+            BloomFilter filter =
+                    bloomFilters.get(filePath);
+
+            if (filter != null
+                    && !filter.mightContain(key)) {
+                continue;
+            }
 
             SSTableReader.Result result =
                     SSTableReader.get(filePath, key);
 
-            if (result.status == SSTableReader.Status.FOUND) {
+            if (result.status ==
+                    SSTableReader.Status.FOUND) {
+
                 return result.value;
             }
 
-            if (result.status == SSTableReader.Status.DELETED) {
+            if (result.status ==
+                    SSTableReader.Status.DELETED) {
+
                 return null;
             }
         }
@@ -135,6 +177,7 @@ public class KVStore {
             throws IOException {
 
         wal.appendDelete(key);
+
         memtable.delete(key);
 
         approxBytes += key.length();
@@ -152,21 +195,40 @@ public class KVStore {
         String filePath =
                 "sstable-" + sstableCounter + ".sst";
 
-        SSTableWriter.write(filePath, entries);
+        SSTableWriter.write(
+                filePath,
+                entries
+        );
 
         wal.truncate();
 
+        BloomFilter filter =
+                BloomFilter.fromEntries(entries);
+
+        String bloomPath =
+                filePath + ".bloom";
+
+        filter.save(bloomPath);
+
+        bloomFilters.put(
+                filePath,
+                filter
+        );
+
         sstableFiles.add(filePath);
+
         sstableCounter++;
 
         memtable = new SkipList();
+
         approxBytes = 0;
 
-        System.out.println("Flushed: " + filePath);
+        System.out.println(
+                "Flushed: " + filePath
+        );
     }
 
     public void close() throws IOException {
-
         wal.close();
     }
 
@@ -174,14 +236,14 @@ public class KVStore {
             throws IOException {
 
         KVStore store = new KVStore();
+
         Scanner sc = new Scanner(System.in);
 
         while (true) {
 
             System.out.print("> ");
 
-            String input = sc.nextLine();
-            input = input.trim();
+            String input = sc.nextLine().trim();
 
             if (input.equals("exit")) {
                 break;
@@ -192,41 +254,56 @@ public class KVStore {
                 continue;
             }
 
-            String[] parts = input.split("\\s+");
+            String[] parts =
+                    input.split("\\s+");
+
             String command = parts[0];
 
             if (command.equals("put")) {
 
                 if (parts.length < 3) {
-                    System.out.println("Missing arguments");
+                    System.out.println(
+                            "Missing arguments"
+                    );
                 } else {
-                    store.put(parts[1], parts[2]);
+                    store.put(
+                            parts[1],
+                            parts[2]
+                    );
                 }
 
             } else if (command.equals("get")) {
 
                 if (parts.length < 2) {
-                    System.out.println("Missing arguments");
-                } else {
                     System.out.println(
-                            store.get(parts[1])
+                            "Missing arguments"
                     );
+                } else {
+
+                    String value =
+                            store.get(parts[1]);
+
+                    System.out.println(value);
                 }
 
             } else if (command.equals("delete")) {
 
                 if (parts.length < 2) {
-                    System.out.println("Missing arguments");
+                    System.out.println(
+                            "Missing arguments"
+                    );
                 } else {
                     store.delete(parts[1]);
                 }
 
             } else {
-                System.out.println("Unknown Command");
+                System.out.println(
+                        "Unknown Command"
+                );
             }
         }
 
-        store.close();
         sc.close();
+        store.close();
     }
 }
