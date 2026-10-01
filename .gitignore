@@ -9,13 +9,11 @@ build/
 .vscode/
 .idea/
 *.iml
- 
+
 # VS Code Code Runner temp file
 tempCodeRunnerFile.java
 
-# WAL data files
-*.log
-
-# WAL data files
+# WAL and SSTable data files
 *.log
 *.wal
+*.sst
