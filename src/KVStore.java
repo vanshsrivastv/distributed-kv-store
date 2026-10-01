@@ -1,36 +1,168 @@
+import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Scanner;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class KVStore {
 
     private static final String WAL_FILE = "store.wal";
+    private static final long FLUSH_THRESHOLD = 30;
 
-    private final SkipList memtable;
+    private static final Pattern SSTABLE_PATTERN =
+            Pattern.compile("sstable-(\\d+)\\.sst");
+
+    private SkipList memtable;
     private final WriteAheadLog wal;
+
+    private long approxBytes = 0;
+    private int sstableCounter = 0;
+
+    private final List<String> sstableFiles = new ArrayList<>();
 
     public KVStore() throws IOException {
 
         memtable = new SkipList();
+
+        loadSSTables();
+
         wal = new WriteAheadLog(WAL_FILE);
 
         wal.recover(memtable);
     }
 
-    public void put(String key, String value) throws IOException {
+    private void loadSSTables() {
+
+        File directory = new File(".");
+
+        File[] files = directory.listFiles(
+                (dir, name) ->
+                        SSTABLE_PATTERN.matcher(name).matches()
+        );
+
+        if (files == null) {
+            return;
+        }
+
+        Arrays.sort(
+                files,
+                Comparator.comparingInt(
+                        file -> extractSSTableNumber(file.getName())
+                )
+        );
+
+        int highestNumber = -1;
+
+        for (File file : files) {
+
+            sstableFiles.add(file.getName());
+
+            int number =
+                    extractSSTableNumber(file.getName());
+
+            if (number > highestNumber) {
+                highestNumber = number;
+            }
+        }
+
+        sstableCounter = highestNumber + 1;
+    }
+
+    private int extractSSTableNumber(String fileName) {
+
+        Matcher matcher =
+                SSTABLE_PATTERN.matcher(fileName);
+
+        if (!matcher.matches()) {
+            throw new IllegalArgumentException(
+                    "Invalid SSTable filename: " + fileName
+            );
+        }
+
+        return Integer.parseInt(matcher.group(1));
+    }
+
+    public void put(String key, String value)
+            throws IOException {
 
         wal.appendPut(key, value);
         memtable.put(key, value);
+
+        approxBytes += key.length() + value.length();
+
+        if (approxBytes >= FLUSH_THRESHOLD) {
+            flush();
+        }
     }
 
-    public String get(String key) {
+    public String get(String key) throws IOException {
 
-        return memtable.get(key);
+        SkipList.LookupResult memResult =
+                memtable.lookup(key);
+
+        if (memResult.status == SkipList.Status.FOUND) {
+            return memResult.value;
+        }
+
+        if (memResult.status == SkipList.Status.DELETED) {
+            return null;
+        }
+
+        for (int i = sstableFiles.size() - 1; i >= 0; i--) {
+
+            String filePath = sstableFiles.get(i);
+
+            SSTableReader.Result result =
+                    SSTableReader.get(filePath, key);
+
+            if (result.status == SSTableReader.Status.FOUND) {
+                return result.value;
+            }
+
+            if (result.status == SSTableReader.Status.DELETED) {
+                return null;
+            }
+        }
+
+        return null;
     }
 
-    public void delete(String key) throws IOException {
+    public void delete(String key)
+            throws IOException {
 
         wal.appendDelete(key);
         memtable.delete(key);
+
+        approxBytes += key.length();
+
+        if (approxBytes >= FLUSH_THRESHOLD) {
+            flush();
+        }
+    }
+
+    private void flush() throws IOException {
+
+        List<SkipList.Entry> entries =
+                memtable.entries();
+
+        String filePath =
+                "sstable-" + sstableCounter + ".sst";
+
+        SSTableWriter.write(filePath, entries);
+
+        wal.truncate();
+
+        sstableFiles.add(filePath);
+        sstableCounter++;
+
+        memtable = new SkipList();
+        approxBytes = 0;
+
+        System.out.println("Flushed: " + filePath);
     }
 
     public void close() throws IOException {
@@ -38,7 +170,8 @@ public class KVStore {
         wal.close();
     }
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args)
+            throws IOException {
 
         KVStore store = new KVStore();
         Scanner sc = new Scanner(System.in);
@@ -46,6 +179,7 @@ public class KVStore {
         while (true) {
 
             System.out.print("> ");
+
             String input = sc.nextLine();
             input = input.trim();
 
@@ -74,7 +208,9 @@ public class KVStore {
                 if (parts.length < 2) {
                     System.out.println("Missing arguments");
                 } else {
-                    System.out.println(store.get(parts[1]));
+                    System.out.println(
+                            store.get(parts[1])
+                    );
                 }
 
             } else if (command.equals("delete")) {
