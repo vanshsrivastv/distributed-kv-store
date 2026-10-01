@@ -3,6 +3,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -13,8 +14,8 @@ public class WriteAheadLog {
     private static final byte PUT = 0;
     private static final byte DELETE = 1;
 
-    private final FileOutputStream output;
-    private final DataOutputStream dataOutput;
+    private FileOutputStream output;
+    private DataOutputStream dataOutput;
     private final String filePath;
 
     public WriteAheadLog(String filePath) throws IOException {
@@ -87,7 +88,8 @@ public class WriteAheadLog {
     public void recover(SkipList list) throws IOException {
 
         try (DataInputStream input =
-                     new DataInputStream(new FileInputStream(filePath))) {
+                     new DataInputStream(
+                             new FileInputStream(filePath))) {
 
             while (true) {
 
@@ -160,6 +162,20 @@ public class WriteAheadLog {
         }
 
         input.close();
+    }
+
+    public void truncate() throws IOException {
+
+        dataOutput.close();
+
+        File file = new File(filePath);
+
+        if (!file.delete()) {
+            throw new IOException("Failed to delete WAL file");
+        }
+
+        output = new FileOutputStream(filePath, true);
+        dataOutput = new DataOutputStream(output);
     }
 
     public void close() throws IOException {
