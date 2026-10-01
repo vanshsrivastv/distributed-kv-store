@@ -345,3 +345,132 @@ exits normally or even after it's killed, masking whether the WAL and `fsync` lo
 actually works. Running recovery as a genuinely separate process, reading only what
 already exists on disk from a prior run, is the only way to confirm the data's
 durability doesn't depend on that first process still being alive.
+
+---
+
+## Stage 5: SSTables
+
+**Status:** Complete
+
+### Concepts covered
+- A MemTable can't grow forever: past a size threshold, it's frozen and flushed to
+  disk as an **SSTable** (Sorted String Table), an immutable file, while a fresh,
+  empty MemTable takes over new writes
+- Why immutable: an SSTable, once written, is never edited again. Any update, even
+  to a key an old SSTable already has, always goes to the current MemTable. This is
+  what makes concurrent reads of an SSTable safe with zero locking, and what makes
+  compaction (Stage 7) a clean operation on whole files rather than in-place edits
+- Why sorted: SSTables are flushed directly from the already-sorted skip list, so a
+  flush is a simple in-order walk, no separate sorting step needed
+- Tombstones must survive the flush, exactly like they must survive to begin with:
+  a deleted key's tombstone is written into the SSTable as a real record, not
+  dropped, otherwise an old SSTable's stale value could resurface after the newer
+  tombstone's MemTable gets flushed and discarded
+- Reused the Stage 4 binary framing (length-prefixed payload + CRC32 checksum) for
+  SSTable records, same shape, different meaning: WAL records are instructions to
+  replay in order to rebuild a MemTable; SSTable records are a sorted snapshot of
+  final key state, looked up directly by key, never replayed in sequence
+- A single-file lookup needs **three** outcomes, not two: found with a value, found
+  as a tombstone (stop, the key is definitively deleted, don't check older files),
+  or not present in this file at all (keep checking older files). A plain
+  value-or-null return can't distinguish the last two, which would let a deleted key
+  resurrect from an older file. Fixed by giving both `SkipList` (`lookup`, alongside
+  the simpler existing `get`) and `SSTableReader` (`get` returning a `Result`) the
+  same `FOUND`/`DELETED`/`NOT_FOUND` shape
+- A torn/corrupted record is handled oppositely in the two layers: WAL recovery
+  stops quietly, since a torn tail is an expected consequence of a crash mid-append
+  during live operation. SSTableReader throws loudly on the same byte-level failure,
+  since a finished, `fsync`'d SSTable has no legitimate code path that produces a
+  half-written file, so corruption there means something genuinely went wrong
+- Wired `KVStore` to actually use `SkipList` and `WriteAheadLog` together for the
+  first time (they'd only existed as separately-tested components until this
+  stage): WAL-then-MemTable write order, startup recovery, and a real `close()`
+  separate from the crash path
+- Flush is triggered by an approximate byte-size counter (`key.length() + value.length()`
+  summed since the last flush), an intentional simplification, not exact in-memory
+  footprint accounting, which is its own rabbit hole the spec doesn't actually
+  require
+- Closed Stage 4's deferred item: once a flush's SSTable is written and `fsync`'d,
+  the WAL is truncated (closed, deleted, reopened fresh), since every record in it
+  is now redundant with what's safely on disk
+- Found a real bug by testing a restart, not by reading code: the list of which
+  SSTable files exist was only ever tracked in memory, populated by `flush()` in
+  that process, so a fresh process started with an empty list and silently
+  returned `null` for every key that only lived in an SSTable, even though the
+  files on disk were completely correct. Fixed by rebuilding that list on startup
+  by scanning the directory for `sstable-<n>.sst` files, sorting by the **numeric**
+  value of `n` (not alphabetically, `"sstable-10.sst"` would otherwise sort before
+  `"sstable-2.sst"`), and resuming the counter from the highest number found plus
+  one
+
+### What I built
+- `src/SkipList.java`: added `entries()` (walks level 0 to return every key in
+  sorted order, including tombstones, for flushing) and `lookup()` (tri-state
+  result; `get` is now a thin wrapper over it)
+- `src/SSTableWriter.java`: writes a sorted `List<Entry>` to a file using the same
+  length-prefixed, checksummed binary framing as the WAL
+- `src/SSTableReader.java`: looks up a single key in one SSTable file via linear
+  scan, returning a tri-state `Result` (`FOUND`/`DELETED`/`NOT_FOUND`)
+- `src/WriteAheadLog.java`: added `truncate()` (close, delete, reopen fresh) for
+  use right after a successful flush
+- `src/KVStore.java`: now backed by `SkipList` + `WriteAheadLog` instead of a
+  `HashMap`; tracks approximate MemTable size and flushes to a numbered SSTable
+  file past a threshold; `get` checks the current MemTable, then each SSTable
+  newest-to-oldest, stopping at the first `FOUND` or `DELETED`; rediscovers
+  existing SSTable files and the correct next file number on startup
+
+### Known deferred work
+- The approximate byte counter doesn't account for whatever a recovered MemTable
+  already contains after a restart, it starts at zero regardless. Not a
+  correctness bug (no data loss), just imprecise flush timing, and mostly masked
+  by WAL truncation keeping post-flush recovery small in practice
+- No indexing within an SSTable yet, lookups are a full linear scan. Bloom filters
+  (Stage 6) are the spec-required fix for this; a sparse in-file index is a
+  possible further optimization but isn't required and hasn't been built
+- As more SSTables accumulate, old, superseded data is never reclaimed, that's
+  compaction (Stage 7)
+
+### Interview Checkpoint: Q&A
+
+**Q1: Why must SSTables be immutable, and what does that buy you?**
+A: An SSTable is never edited after it's written; any new write, even to an
+existing key, goes to the current MemTable instead. This makes concurrent reads of
+an SSTable safe without any locking, since the file can never change underneath a
+reader, and it makes compaction well-defined later: merging whole immutable files
+into new ones, never patching a file in place.
+
+**Q2: Why does looking up a key in a single SSTable need three possible outcomes
+instead of two?**
+A: Found-with-a-value and not-present-in-this-file aren't the only cases, found as
+a tombstone is a third, distinct outcome, meaning the key was deleted and the
+search must stop immediately rather than continuing to older files. Collapsing
+"deleted" and "not found here" into the same null return would let an older SSTable's
+stale value resurface after a newer tombstone, the exact stale-read bug from Stage 3,
+recurring one layer down.
+
+**Q3: Why does a torn WAL record get handled quietly while a torn or corrupted
+SSTable record throws an exception?**
+A: A WAL is appended to continuously by a live process that can crash at any
+instant, so a torn record at its tail is an expected, normal outcome worth handling
+gracefully. An SSTable is written once, completely, and `fsync`'d before anyone
+reads it, there's no legitimate way for a finished SSTable to be half-written.
+Finding corruption there means something is actually wrong, and failing loudly is
+safer than silently serving data that can't be trusted.
+
+**Q4: Why must a flush's SSTable be written and `fsync`'d before the corresponding
+WAL entries are truncated, and not the other way around?**
+A: If the WAL were truncated first and the SSTable write then failed or the
+process crashed mid-write, that data would be lost with no copy anywhere, neither
+a complete SSTable nor a WAL record of it. Writing (and `fsync`-ing) the SSTable
+first guarantees a durable copy exists before the only other durable copy is
+discarded.
+
+**Q5: Why did `KVStore` return `null` for every key after a restart, even though
+the SSTable files on disk were correct, and what does that bug reveal?**
+A: The list of known SSTable files was only tracked in an in-memory field,
+populated as `flush()` ran during that process's lifetime, with nothing rebuilding
+it from disk on startup. A new process started with an empty list, so `get`'s
+fallback loop had nothing to search, even though the files themselves held
+correct data. It's the same category of problem as needing WAL replay to rebuild
+a MemTable: any state that only lives in memory needs an explicit, tested recovery
+path, or it silently vanishes on restart.
