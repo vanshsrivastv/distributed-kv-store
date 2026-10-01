@@ -474,3 +474,118 @@ fallback loop had nothing to search, even though the files themselves held
 correct data. It's the same category of problem as needing WAL replay to rebuild
 a MemTable: any state that only lives in memory needs an explicit, tested recovery
 path, or it silently vanishes on restart.
+
+---
+
+## Stage 6: Bloom Filters
+
+**Status:** Complete
+
+### Concepts covered
+- The problem: `SSTableReader.get` does a full linear scan of a file. With many
+  SSTables accumulated over time, a lookup for a key that doesn't exist anywhere
+  has to scan every single file before concluding "not found." A Bloom filter, one
+  per SSTable, kept in RAM, answers "could this key possibly be in this file?"
+  fast, before any disk read happens
+- A Bloom filter is a bit array plus `k` hash functions. Adding a key sets `k` bits
+  (one per hash). Checking a key reads the same `k` bits: if any is `0`, the key is
+  **definitely not** present (no false negatives, ever); if all are `1`, the key is
+  **possibly** present, this "maybe" can be wrong (a **false positive**), when
+  unrelated keys happened to set all the same bits by coincidence
+- Double hashing: rather than writing `k` genuinely independent hash functions,
+  compute two real, different hashes (`h1` = `String.hashCode()`, `h2` = hand-rolled
+  FNV-1a) and derive all `k` indices as `(h1 + i*h2) mod m`. A real engineering
+  shortcut used in production, not a simplification unique to this project
+- A signed-byte bug worth remembering: XOR-ing a Java `byte` directly into a hash
+  without masking (`b & 0xff`) sign-extends negative byte values and silently
+  corrupts the hash for certain input bytes
+- `Math.floorMod` instead of `%` for turning a (possibly negative) hash into an
+  array index, Java's `%` can return a negative result for a negative dividend,
+  which would otherwise crash with an `ArrayIndexOutOfBoundsException`
+- Proved the false-positive/size tradeoff experimentally, not just in theory: a
+  generously-sized filter (1000 bits, 3 hashes, 5 keys) produced 0/25 false
+  positives; the same 5 keys in a deliberately undersized filter (20 bits, 3
+  hashes) produced 5/25, both results are "correct" for their respective sizing,
+  the filter never misses a key that's really there, but a too-small filter makes
+  false positives common
+- Tombstones must be added to the filter too, same recurring lesson from every
+  earlier layer: the filter answers "does this file contain *any* record for this
+  key," not "a live value." Omitting tombstoned keys would make the filter say
+  "definitely not here" for a key that's actually there as a tombstone, causing
+  that file (and its tombstone) to be skipped entirely, letting a stale value in
+  an older SSTable resurface
+- A Bloom filter, unlike the WAL or an SSTable, is never the source of truth, it's
+  a pure optimization sitting in front of data that's already durable elsewhere.
+  That changes the correct failure response: a missing or corrupted filter file
+  must be treated as if it said "maybe" (fall back to a real scan for that file),
+  never as if it said "definitely not" (which would risk skipping a file that
+  actually has the key, an actual correctness bug, not just a lost optimization)
+
+### What I built
+- `src/BloomFilter.java`: bit array backed by `boolean[]`, `h1`/`h2` double
+  hashing, `add`/`mightContain`, `fromEntries` (builds a filter from a flush's
+  sorted entry list, including tombstones, sized at roughly 10 bits per key),
+  `save`/`load` for persisting the bit array to a sidecar file
+- `src/KVStore.java`: a filter is built and saved alongside every SSTable at flush
+  time; on startup, SSTable discovery also attempts to load each file's filter,
+  tolerating a missing or corrupted one without crashing; `get`'s SSTable fallback
+  loop checks the filter before reading a file, skipping straight to the next
+  (older) file whenever the filter confidently says the key isn't there
+- Verified the skip behavior directly (temporary debug prints, since removed):
+  looking up a key that only existed in an early SSTable correctly skipped the
+  newer file's filter and found it in the right one; looking up a key that existed
+  nowhere correctly skipped every file's real read entirely
+
+### Known deferred work
+- Bits are persisted one-per-byte (`writeBoolean` per bit) rather than packed 8
+  bits to a byte. Correct, just not space-efficient, real bit-packing is a
+  worthwhile optional optimization, not required for correctness
+- Filter sizing uses a fixed rule of thumb (10 bits/key, 3 hashes) rather than the
+  formal formula relating bits-per-key, hash count, and target false-positive
+  rate. Good enough here, worth knowing the real formula exists
+
+### Interview Checkpoint: Q&A
+
+**Q1: What does a Bloom filter actually guarantee, and what can it get wrong?**
+A: It guarantees no false negatives, if a key was added, checking for it will
+always return "possibly present," never "definitely not." What it can get wrong is
+a false positive: reporting "possibly present" for a key that was never added,
+because every bit position it would have set happens to already be `1` from other
+keys. It can never incorrectly say "definitely not" for a key that's really there.
+
+**Q2: Why use double hashing instead of writing `k` separate hash functions?**
+A: Calling the same hash function `k` times on the same key gives the same output
+every time, no new information. Writing `k` genuinely independent hash functions
+is more work than needed; computing two different hashes and combining them as
+`(h1 + i*h2) mod m` simulates `k` independent-enough hash functions from only two
+real computations, a standard, proven technique, not a shortcut unique to this
+project.
+
+**Q3: Why did a 20-bit filter produce false positives while a 1000-bit filter
+(same 5 keys) produced none, and does the zero-false-positive result mean
+something was broken?**
+A: Zero false positives wasn't broken, it was the correct outcome for a filter
+sized generously relative to how few keys it held, few bits were set, so
+collisions with unrelated keys were unlikely. Shrinking the filter to 20 bits
+packed the same 15 set bits into a much smaller space, making it likely that an
+unrelated key's hash positions would coincidentally all land on already-set bits.
+False positives are an inherent, expected cost of the technique that gets worse as
+a filter fills up relative to its size, not a sign of a bug.
+
+**Q4: Why must a key's tombstone be added to its SSTable's Bloom filter the same
+way a live value is?**
+A: The filter's job is answering "does this file contain any record for this key,"
+not "does this file contain a live value." If a tombstoned key were left out of
+the filter, a lookup would get "definitely not here" and skip the file entirely,
+skipping right past the tombstone that was supposed to stop the search. An older
+SSTable's stale value for that key could then resurface, the same stale-read bug
+that's had to be prevented at every other layer.
+
+**Q5: Why is a missing or corrupted Bloom filter file handled differently from a
+missing or corrupted SSTable record?**
+A: A Bloom filter is never the source of truth, the SSTable's actual records are.
+Losing the filter only means losing a performance shortcut; falling back to a full
+scan for that file is always safe, it can never produce a wrong answer, only a
+slower one. An SSTable record's corruption is different because the record itself
+is the only copy of that data, so a failure there must be surfaced loudly rather
+than silently trusted.
