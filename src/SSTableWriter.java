@@ -1,7 +1,12 @@
+
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.List;
 import java.util.zip.CRC32;
 
@@ -14,52 +19,67 @@ public class SSTableWriter {
             String filePath,
             List<SkipList.Entry> entries) throws IOException {
 
-        FileOutputStream fileOutput =
-                new FileOutputStream(filePath);
+        Path finalPath = Paths.get(filePath);
+        Path temporaryPath = Paths.get(filePath + ".tmp");
 
-        DataOutputStream output =
-                new DataOutputStream(fileOutput);
+        try {
 
-        for (SkipList.Entry entry : entries) {
+            try (FileOutputStream fileOutput =
+                         new FileOutputStream(temporaryPath.toFile());
 
-            byte[] payload = buildPayload(entry);
+                 DataOutputStream output =
+                         new DataOutputStream(fileOutput)) {
 
-            CRC32 crc = new CRC32();
-            crc.update(payload);
+                for (SkipList.Entry entry : entries) {
 
-            long checksum = crc.getValue();
+                    byte[] payload = buildPayload(entry);
 
-            output.writeInt(payload.length);
-            output.write(payload);
-            output.writeLong(checksum);
+                    CRC32 crc = new CRC32();
+                    crc.update(payload);
+
+                    long checksum = crc.getValue();
+
+                    output.writeInt(payload.length);
+                    output.write(payload);
+                    output.writeLong(checksum);
+                }
+
+                output.flush();
+                fileOutput.getFD().sync();
+            }
+
+            Files.move(
+                    temporaryPath,
+                    finalPath,
+                    StandardCopyOption.ATOMIC_MOVE
+            );
+
+        } catch (IOException e) {
+            throw e;
         }
-
-        fileOutput.getFD().sync();
-        output.close();
     }
 
-    private static byte[] buildPayload(SkipList.Entry entry)
-            throws IOException {
+    private static byte[] buildPayload(
+            SkipList.Entry entry) throws IOException {
 
         ByteArrayOutputStream buffer =
                 new ByteArrayOutputStream();
 
-        DataOutputStream output =
-                new DataOutputStream(buffer);
+        try (DataOutputStream output =
+                     new DataOutputStream(buffer)) {
 
-        if (entry.tombstone) {
+            if (entry.tombstone) {
 
-            output.writeByte(TOMBSTONE);
-            output.writeUTF(entry.key);
+                output.writeByte(TOMBSTONE);
+                output.writeUTF(entry.key);
 
-        } else {
+            } else {
 
-            output.writeByte(VALUE);
-            output.writeUTF(entry.key);
-            output.writeUTF(entry.value);
+                output.writeByte(VALUE);
+                output.writeUTF(entry.key);
+                output.writeUTF(entry.value);
+            }
         }
-
-        output.close();
 
         return buffer.toByteArray();
     }
