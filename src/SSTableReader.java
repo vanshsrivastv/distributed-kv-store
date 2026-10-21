@@ -1,8 +1,11 @@
+
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.EOFException;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.zip.CRC32;
 
 public class SSTableReader {
@@ -39,7 +42,8 @@ public class SSTableReader {
             throws IOException {
 
         try (DataInputStream input =
-                     new DataInputStream(new FileInputStream(filePath))) {
+                     new DataInputStream(
+                             new FileInputStream(filePath))) {
 
             while (true) {
 
@@ -51,12 +55,20 @@ public class SSTableReader {
                     return new Result(Status.NOT_FOUND, null);
                 }
 
+                if (payloadLength <= 0) {
+                    throw new IOException(
+                            "Invalid SSTable record length"
+                    );
+                }
+
                 byte[] payload = new byte[payloadLength];
 
                 try {
                     input.readFully(payload);
                 } catch (EOFException e) {
-                    throw new IOException("Torn SSTable record", e);
+                    throw new IOException(
+                            "Torn SSTable record", e
+                    );
                 }
 
                 long storedChecksum;
@@ -64,55 +76,160 @@ public class SSTableReader {
                 try {
                     storedChecksum = input.readLong();
                 } catch (EOFException e) {
-                    throw new IOException("Torn SSTable record", e);
+                    throw new IOException(
+                            "Torn SSTable record", e
+                    );
                 }
 
                 CRC32 crc = new CRC32();
                 crc.update(payload);
 
-                long calculatedChecksum = crc.getValue();
-
-                if (storedChecksum != calculatedChecksum) {
-                    throw new IOException("Corrupted SSTable record");
+                if (storedChecksum != crc.getValue()) {
+                    throw new IOException(
+                            "Corrupted SSTable record"
+                    );
                 }
 
-                DataInputStream payloadInput =
-                        new DataInputStream(
-                                new ByteArrayInputStream(payload));
+                try (DataInputStream record =
+                             new DataInputStream(
+                                     new ByteArrayInputStream(payload))) {
 
-                byte type = payloadInput.readByte();
-                String recordKey = payloadInput.readUTF();
+                    byte type = record.readByte();
+                    String recordKey = record.readUTF();
 
-                if (recordKey.equals(key)) {
+                    if (recordKey.equals(key)) {
 
-                    if (type == VALUE) {
+                        if (type == VALUE) {
 
-                        String value = payloadInput.readUTF();
-                        payloadInput.close();
+                            String value = record.readUTF();
 
-                        return new Result(Status.FOUND, value);
+                            return new Result(
+                                    Status.FOUND, value
+                            );
 
-                    } else if (type == TOMBSTONE) {
+                        } else if (type == TOMBSTONE) {
 
-                        payloadInput.close();
+                            return new Result(
+                                    Status.DELETED, null
+                            );
 
-                        return new Result(Status.DELETED, null);
+                        } else {
+                            throw new IOException(
+                                    "Unknown SSTable record type"
+                            );
+                        }
                     }
                 }
-
-                payloadInput.close();
             }
         }
     }
 
+    public static List<SkipList.Entry> readAll(String filePath)
+            throws IOException {
+
+        List<SkipList.Entry> entries = new ArrayList<>();
+
+        try (DataInputStream input =
+                     new DataInputStream(
+                             new FileInputStream(filePath))) {
+
+            while (true) {
+
+                int payloadLength;
+
+                try {
+                    payloadLength = input.readInt();
+                } catch (EOFException e) {
+                    break;
+                }
+
+                if (payloadLength <= 0) {
+                    throw new IOException(
+                            "Invalid SSTable record length"
+                    );
+                }
+
+                byte[] payload = new byte[payloadLength];
+
+                try {
+                    input.readFully(payload);
+                } catch (EOFException e) {
+                    throw new IOException(
+                            "Torn SSTable record", e
+                    );
+                }
+
+                long storedChecksum;
+
+                try {
+                    storedChecksum = input.readLong();
+                } catch (EOFException e) {
+                    throw new IOException(
+                            "Torn SSTable record", e
+                    );
+                }
+
+                CRC32 crc = new CRC32();
+                crc.update(payload);
+
+                if (storedChecksum != crc.getValue()) {
+                    throw new IOException(
+                            "Corrupted SSTable record"
+                    );
+                }
+
+                try (DataInputStream record =
+                             new DataInputStream(
+                                     new ByteArrayInputStream(payload))) {
+
+                    byte type = record.readByte();
+                    String key = record.readUTF();
+
+                    if (type == VALUE) {
+
+                        String value = record.readUTF();
+
+                        entries.add(
+                                new SkipList.Entry(
+                                        key, value, false
+                                )
+                        );
+
+                    } else if (type == TOMBSTONE) {
+
+                        entries.add(
+                                new SkipList.Entry(
+                                        key, null, true
+                                )
+                        );
+
+                    } else {
+                        throw new IOException(
+                                "Unknown SSTable record type"
+                        );
+                    }
+                }
+            }
+        }
+
+        return entries;
+    }
+
     public static void main(String[] args) throws IOException {
 
-        Result apple = get("test.sst", "apple");
-        Result mango = get("test.sst", "mango");
-        Result kiwi = get("test.sst", "kiwi");
+        System.out.println("Reading all records:");
 
-        System.out.println("apple: " + apple);
-        System.out.println("mango: " + mango);
-        System.out.println("kiwi: " + kiwi);
+        List<SkipList.Entry> entries =
+                readAll("test.sst");
+
+        for (SkipList.Entry entry : entries) {
+            System.out.println(entry);
+        }
+
+        System.out.println("\nIndividual lookups:");
+
+        System.out.println("apple: " + get("test.sst", "apple"));
+        System.out.println("mango: " + get("test.sst", "mango"));
+        System.out.println("kiwi: " + get("test.sst", "kiwi"));
     }
 }
