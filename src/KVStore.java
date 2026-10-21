@@ -1,3 +1,4 @@
+
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -34,6 +35,7 @@ public class KVStore {
 
         memtable = new SkipList();
 
+        cleanupTemporaryFiles();
         loadSSTables();
 
         wal = new WriteAheadLog(WAL_FILE);
@@ -41,7 +43,37 @@ public class KVStore {
         wal.recover(memtable);
     }
 
-    private void loadSSTables() {
+    private void cleanupTemporaryFiles() throws IOException {
+
+        File directory = new File(".");
+
+        File[] files = directory.listFiles(
+                (dir, name) ->
+                        name.startsWith("sstable-")
+                                && name.endsWith(".tmp")
+        );
+
+        if (files == null) {
+            return;
+        }
+
+        for (File file : files) {
+
+            if (!file.delete()) {
+                throw new IOException(
+                        "Failed to delete temporary file: "
+                                + file.getName()
+                );
+            }
+
+            System.out.println(
+                    "Removed temporary file: "
+                            + file.getName()
+            );
+        }
+    }
+
+    private void loadSSTables() throws IOException {
 
         File directory = new File(".");
 
@@ -57,7 +89,9 @@ public class KVStore {
         Arrays.sort(
                 files,
                 Comparator.comparingInt(
-                        file -> extractSSTableNumber(file.getName())
+                        file -> extractSSTableNumber(
+                                file.getName()
+                        )
                 )
         );
 
@@ -105,7 +139,8 @@ public class KVStore {
 
         if (!matcher.matches()) {
             throw new IllegalArgumentException(
-                    "Invalid SSTable filename: " + fileName
+                    "Invalid SSTable filename: "
+                            + fileName
             );
         }
 
@@ -159,13 +194,11 @@ public class KVStore {
 
             if (result.status ==
                     SSTableReader.Status.FOUND) {
-
                 return result.value;
             }
 
             if (result.status ==
                     SSTableReader.Status.DELETED) {
-
                 return null;
             }
         }
@@ -195,12 +228,7 @@ public class KVStore {
         String filePath =
                 "sstable-" + sstableCounter + ".sst";
 
-        SSTableWriter.write(
-                filePath,
-                entries
-        );
-
-        wal.truncate();
+        SSTableWriter.write(filePath, entries);
 
         BloomFilter filter =
                 BloomFilter.fromEntries(entries);
@@ -210,10 +238,9 @@ public class KVStore {
 
         filter.save(bloomPath);
 
-        bloomFilters.put(
-                filePath,
-                filter
-        );
+        wal.truncate();
+
+        bloomFilters.put(filePath, filter);
 
         sstableFiles.add(filePath);
 
@@ -223,8 +250,84 @@ public class KVStore {
 
         approxBytes = 0;
 
+        System.out.println("Flushed: " + filePath);
+    }
+
+    public void compact() throws IOException {
+
+        if (sstableFiles.size() < 2) {
+            System.out.println(
+                    "Not enough SSTables to compact."
+            );
+            return;
+        }
+
+        List<String> oldFiles =
+                new ArrayList<>(sstableFiles);
+
+        List<SkipList.Entry> merged =
+                SSTableReader.readAll(oldFiles.get(0));
+
+        for (int i = 1; i < oldFiles.size(); i++) {
+
+            List<SkipList.Entry> newer =
+                    SSTableReader.readAll(oldFiles.get(i));
+
+            boolean dropTombstones =
+                    (i == oldFiles.size() - 1);
+
+            merged = Compactor.merge(
+                    merged,
+                    newer,
+                    dropTombstones
+            );
+        }
+
+        String newFile =
+                "sstable-" + sstableCounter + ".sst";
+
+        SSTableWriter.write(newFile, merged);
+
+        BloomFilter filter =
+                BloomFilter.fromEntries(merged);
+
+        String newBloomFile =
+                newFile + ".bloom";
+
+        filter.save(newBloomFile);
+
+        sstableCounter++;
+
+        sstableFiles.clear();
+        sstableFiles.add(newFile);
+
+        bloomFilters.clear();
+        bloomFilters.put(newFile, filter);
+
+        // Delete oldest first so surviving files retain newer values and tombstones.
+        for (String oldFile : oldFiles) {
+
+            File sstable = new File(oldFile);
+
+            if (sstable.exists() && !sstable.delete()) {
+                throw new IOException(
+                        "Failed to delete " + oldFile
+                );
+            }
+
+            File bloom = new File(oldFile + ".bloom");
+
+            if (bloom.exists() && !bloom.delete()) {
+                throw new IOException(
+                        "Failed to delete "
+                                + oldFile + ".bloom"
+                );
+            }
+        }
+
         System.out.println(
-                "Flushed: " + filePath
+                "Compaction complete. SSTables remaining: "
+                        + sstableFiles.size()
         );
     }
 
@@ -239,71 +342,74 @@ public class KVStore {
 
         Scanner sc = new Scanner(System.in);
 
-        while (true) {
+        try {
 
-            System.out.print("> ");
+            while (true) {
 
-            String input = sc.nextLine().trim();
+                System.out.print("> ");
 
-            if (input.equals("exit")) {
-                break;
-            }
+                String input = sc.nextLine().trim();
 
-            if (input.isEmpty()) {
-                System.out.println("Unknown Command");
-                continue;
-            }
-
-            String[] parts =
-                    input.split("\\s+");
-
-            String command = parts[0];
-
-            if (command.equals("put")) {
-
-                if (parts.length < 3) {
-                    System.out.println(
-                            "Missing arguments"
-                    );
-                } else {
-                    store.put(
-                            parts[1],
-                            parts[2]
-                    );
+                if (input.equals("exit")) {
+                    break;
                 }
 
-            } else if (command.equals("get")) {
-
-                if (parts.length < 2) {
-                    System.out.println(
-                            "Missing arguments"
-                    );
-                } else {
-
-                    String value =
-                            store.get(parts[1]);
-
-                    System.out.println(value);
+                if (input.isEmpty()) {
+                    System.out.println("Unknown Command");
+                    continue;
                 }
 
-            } else if (command.equals("delete")) {
+                String[] parts =
+                        input.split("\\s+");
 
-                if (parts.length < 2) {
-                    System.out.println(
-                            "Missing arguments"
-                    );
+                String command = parts[0];
+
+                if (command.equals("put")) {
+
+                    if (parts.length < 3) {
+                        System.out.println(
+                                "Missing arguments"
+                        );
+                    } else {
+                        store.put(parts[1], parts[2]);
+                    }
+
+                } else if (command.equals("get")) {
+
+                    if (parts.length < 2) {
+                        System.out.println(
+                                "Missing arguments"
+                        );
+                    } else {
+                        System.out.println(
+                                store.get(parts[1])
+                        );
+                    }
+
+                } else if (command.equals("delete")) {
+
+                    if (parts.length < 2) {
+                        System.out.println(
+                                "Missing arguments"
+                        );
+                    } else {
+                        store.delete(parts[1]);
+                    }
+
+                } else if (command.equals("compact")) {
+
+                    store.compact();
+
                 } else {
-                    store.delete(parts[1]);
+                    System.out.println(
+                            "Unknown Command"
+                    );
                 }
-
-            } else {
-                System.out.println(
-                        "Unknown Command"
-                );
             }
+
+        } finally {
+            sc.close();
+            store.close();
         }
-
-        sc.close();
-        store.close();
     }
 }
